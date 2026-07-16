@@ -56,8 +56,14 @@ class CombinedGeoEncodingVolume:
         self.geo_volume_pyramid.append(geo_volume)
         self.init_corr_pyramid.append(init_corr)
         for _ in range(self.num_levels - 1):
-            geo_volume = F.avg_pool2d(geo_volume, [1, 2], stride=[1, 2])
-            init_corr = F.avg_pool2d(init_corr, [1, 2], stride=[1, 2])
+            # F.avg_pool2d exports as ONNX AveragePool; TensorRT/cuDNN pooling has no
+            # implementation when the folded leading dim (batch*height*width) exceeds
+            # 65535 at high resolutions. reshape+mean is numerically identical and
+            # exports as ReduceMean, which TensorRT handles at any size.
+            b, c, h, w = geo_volume.shape
+            geo_volume = geo_volume.reshape(b, c, h, w // 2, 2).mean(dim=-1)
+            b, c, h, w = init_corr.shape
+            init_corr = init_corr.reshape(b, c, h, w // 2, 2).mean(dim=-1)
             self.geo_volume_pyramid.append(geo_volume)
             self.init_corr_pyramid.append(init_corr)
 
@@ -104,8 +110,6 @@ class ChannelAttentionEnhancement(nn.Module):
     def __init__(self, channels, ratio=16):
         super().__init__()
         hidden = max(channels // ratio, 1)
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
         self.fc = nn.Sequential(
             nn.Conv2d(channels, hidden, 1, bias=False),
             nn.ReLU(inplace=True),
@@ -114,7 +118,12 @@ class ChannelAttentionEnhancement(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        return self.sigmoid(self.fc(self.avg_pool(x)) + self.fc(self.max_pool(x)))
+        # Adaptive{Avg,Max}Pool2d(1) export as AveragePool/MaxPool with kernel=(H,W),
+        # which breaks TensorRT engine builds at large resolutions. Plain reductions
+        # export as ReduceMean/ReduceMax and are TRT-friendly at any resolution.
+        avg_out = self.fc(x.mean(dim=(-2, -1), keepdim=True))
+        max_out = self.fc(x.amax(dim=(-2, -1), keepdim=True))
+        return self.sigmoid(avg_out + max_out)
 
 
 class SpatialAttentionExtractor(nn.Module):
